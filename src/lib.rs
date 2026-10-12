@@ -291,6 +291,8 @@ struct Funcs {
     unary: Handle,
     binary: Handle,
     binary_vec: Handle,
+    binary2d: Handle,
+    transpose: Handle,
     fill: Handle,
     randn: Handle,
     matmul: Handle,
@@ -356,6 +358,8 @@ fn init_dev(drv: &Driver, index: u32) -> Result<Dev, E> {
             unary: get("unary_k")?,
             binary: get("binary_k")?,
             binary_vec: get("binary_vec_k")?,
+            binary2d: get("binary2d_k")?,
+            transpose: get("transpose_k")?,
             fill: get("fill_k")?,
             randn: get("randn_k")?,
             matmul: get("matmul_k")?,
@@ -655,6 +659,41 @@ fn make_dims(shape: &[u64], strides: &[u64]) -> Result<Dims, E> {
     Ok(d)
 }
 
+/// An elementwise op's operands reduced to `[outer, inner]` with inner strides of 0 or 1.
+struct Plan2d {
+    shape: [u64; 2],
+    /// Per operand: `[row stride, column stride]`.
+    strides: [[u64; 2]; 2],
+}
+
+/// Merges dims that are jointly contiguous for the (contiguous) output and both operands, dropping size-1
+/// dims. Returns the result when exactly two dims remain, the inner one is wide enough to fill a warp and
+/// both operands step through it with stride 0 or 1; `None` sends the op to the general kernel.
+fn plan_2d(shape: &[u64], strides: &[&[u64]; 2]) -> Option<Plan2d> {
+    let mut dims: Vec<(u64, [u64; 2])> = Vec::new();
+    for (i, &s) in shape.iter().enumerate() {
+        if s == 1 {
+            continue;
+        }
+        let st = [strides[0][i], strides[1][i]];
+        if let Some(last) = dims.last_mut()
+            && (0..2).all(|o| last.1[o] == st[o].wrapping_mul(s))
+        {
+            last.0 *= s;
+            last.1 = st;
+            continue;
+        }
+        dims.push((s, st));
+    }
+    let [(outer, o_st), (inner, i_st)] = dims[..] else {
+        return None;
+    };
+    (inner >= 32 && i_st.iter().all(|&s| s <= 1)).then_some(Plan2d {
+        shape: [outer, inner],
+        strides: [[o_st[0], i_st[0]], [o_st[1], i_st[1]]],
+    })
+}
+
 fn numel(shape: &[u64]) -> u64 {
     shape.iter().product()
 }
@@ -905,8 +944,28 @@ fn run(
             if numel(s) != n {
                 return err(STATUS_INVALID_ARGUMENT, "input shape does not match output");
             }
-            let mut d = make_dims(s, st)?;
             let mut inp = ins[0].data as usize as CuPtr;
+            // A COPY that is exactly the transpose of a contiguous matrix (what `Tensor::t` and a matmul
+            // backward without transposed-operand support produce) takes the tiled kernel: the generic one
+            // reads or writes with a large stride.
+            if op_code == COPY
+                && s.len() == 2
+                && st[0] == 1
+                && st[1] == s[0]
+                && s[0] > 1
+                && s[1] > 1
+                && s[1].div_ceil(32) <= 65535
+            {
+                let (mut rows, mut cols) = (s[1], s[0]); // source is [rows, cols]; out is [cols, rows]
+                return drv.launch_k(
+                    f.transpose,
+                    (cols.div_ceil(32) as u32, rows.div_ceil(32) as u32),
+                    256,
+                    &mut [p(&mut inp), p(&mut out), p(&mut rows), p(&mut cols)],
+                    "transpose",
+                );
+            }
+            let mut d = make_dims(s, st)?;
             let mut code: c_int = if op_code == COPY { 7 } else { op_code as c_int };
             drv.launch_1d(
                 f.unary,
@@ -942,6 +1001,28 @@ fn run(
                     n4,
                     &mut [p(&mut code), p(&mut a), p(&mut b), p(&mut out), p(&mut n4)],
                     "binary_vec",
+                );
+            }
+            if let Some(plan) = plan_2d(oshape, &[sta, stb]) {
+                let [mut outer, mut inner] = plan.shape;
+                let [[mut sa0, mut sa1], [mut sb0, mut sb1]] = plan.strides;
+                return drv.launch_k(
+                    f.binary2d,
+                    (inner.div_ceil(256) as u32, outer.min(65535) as u32),
+                    256,
+                    &mut [
+                        p(&mut code),
+                        p(&mut a),
+                        p(&mut b),
+                        p(&mut out),
+                        p(&mut outer),
+                        p(&mut inner),
+                        p(&mut sa0),
+                        p(&mut sa1),
+                        p(&mut sb0),
+                        p(&mut sb1),
+                    ],
+                    "binary2d",
                 );
             }
             drv.launch_1d(

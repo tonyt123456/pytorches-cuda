@@ -82,6 +82,46 @@ extern "C" __global__ void binary_vec_k(int op, const float4* __restrict__ a, co
     }
 }
 
+// Same-shape elementwise op over [outer, inner] operands whose inner stride is 0 or 1 and whose row stride
+// is arbitrary: a bias row added to every row, a column added across a row, plain same-layout operands.
+// The general kernel divides by every dim for every element; here a thread owns a column and walks rows.
+extern "C" __global__ void binary2d_k(int op, const float* __restrict__ a, const float* __restrict__ b,
+                                      float* __restrict__ out, u64 outer, u64 inner, u64 sa0, u64 sa1, u64 sb0,
+                                      u64 sb1) {
+    const u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= inner) return;
+    for (u64 o = blockIdx.y; o < outer; o += gridDim.y) {
+        const float x = a[o * sa0 + i * sa1];
+        const float y = b[o * sb0 + i * sb1];
+        float r;
+        switch (op) {
+            case B_ADD: r = x + y; break;
+            case B_SUB: r = x - y; break;
+            case B_MUL: r = x * y; break;
+            default: r = x / y; break;
+        }
+        out[o * inner + i] = r;
+    }
+}
+
+// Tiled 2-D transpose: `in` is a contiguous [R, C] matrix, `out` the contiguous [C, R] transpose. A 32x32
+// tile is staged in shared memory (the +1 pad avoids bank conflicts) so both the reads and the writes are
+// coalesced; a block of 256 threads covers it in four passes. Launch grid ((C+31)/32, (R+31)/32).
+extern "C" __global__ void __launch_bounds__(256) transpose_k(const float* __restrict__ in, float* __restrict__ out,
+                                                              u64 R, u64 C) {
+    __shared__ float tile[32][33];
+    const unsigned tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    const u64 x = (u64)blockIdx.x * 32 + tx;
+    const u64 y = (u64)blockIdx.y * 32 + ty;
+    for (int j = 0; j < 32; j += 8)
+        if (x < C && y + j < R) tile[ty + j][tx] = in[(y + j) * C + x];
+    __syncthreads();
+    const u64 ox = (u64)blockIdx.y * 32 + tx;
+    const u64 oy = (u64)blockIdx.x * 32 + ty;
+    for (int j = 0; j < 32; j += 8)
+        if (ox < R && oy + j < C) out[(oy + j) * R + ox] = tile[tx][ty + j];
+}
+
 // out = a + alpha * b. `out` may alias `a` (in-place update), so no __restrict__ on those two.
 extern "C" __global__ void axpy_k(const float* a, const float* __restrict__ b, float* out, u64 n, float alpha) {
     u64 stride = (u64)gridDim.x * blockDim.x;

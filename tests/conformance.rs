@@ -151,6 +151,52 @@ fn broadcasting_binary_ops() {
     }
 }
 
+/// Operand layouts for the 2-D broadcast kernel (inner dim of at least 32 with stride 0 or 1): a bias row,
+/// a column, leading dims that merge, and layouts that must fall back to the general kernel.
+#[test]
+fn broadcasting_two_d_paths() {
+    let (cpu, gpu) = need_cuda!();
+    let cases: [(&[usize], &[usize]); 7] = [
+        (&[100, 64], &[64]),
+        (&[100, 64], &[100, 1]),
+        (&[64], &[100, 64]),
+        (&[3, 50, 64], &[64]),
+        (&[3, 50, 64], &[50, 1]), // inner stride 0 for one operand, a broadcast middle dim: general kernel
+        (&[1, 100], &[64, 100]),
+        (&[7, 1000], &[1, 1000]),
+    ];
+    for (i, (sa, sb)) in cases.iter().enumerate() {
+        let (ac, ag) = pair(sa, 70 + i as u64, &cpu, &gpu);
+        let (bc, bg) = pair(sb, 90 + i as u64, &cpu, &gpu);
+        let (bc, bg) = (
+            bc.add(&Tensor::scalar_on(2.0, &cpu)),
+            bg.add(&Tensor::scalar_on(2.0, &gpu)),
+        );
+        for (name, f) in [
+            ("add", Tensor::add as fn(&Tensor, &Tensor) -> Tensor),
+            ("sub", Tensor::sub),
+            ("mul", Tensor::mul),
+            ("div", Tensor::div),
+        ] {
+            assert_close(
+                &format!("{name} {sa:?}{sb:?}"),
+                &f(&ag, &bg).to_vec(),
+                &f(&ac, &bc).to_vec(),
+                1e-6,
+            );
+        }
+    }
+    // A transposed operand (inner stride != 1) against a plain one.
+    let (ac, ag) = pair(&[100, 64], 5, &cpu, &gpu);
+    let (bc, bg) = pair(&[64, 100], 6, &cpu, &gpu);
+    assert_close(
+        "t + plain",
+        &ag.t().add(&bg).to_vec(),
+        &ac.t().add(&bc).to_vec(),
+        1e-6,
+    );
+}
+
 #[test]
 fn transpose_strided_copy() {
     let (cpu, gpu) = need_cuda!();

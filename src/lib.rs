@@ -25,7 +25,10 @@ struct E {
 }
 
 fn err<T>(status: Status, msg: impl Into<String>) -> Result<T, E> {
-    Result::Err(E { status, msg: msg.into() })
+    Result::Err(E {
+        status,
+        msg: msg.into(),
+    })
 }
 
 thread_local! {
@@ -75,10 +78,26 @@ struct Driver {
     dtoh: unsafe extern "C" fn(*mut c_void, CuPtr, usize) -> CuResult,
     dtod: unsafe extern "C" fn(CuPtr, CuPtr, usize) -> CuResult,
     mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CuResult,
-    module_load_ex: unsafe extern "C" fn(*mut Handle, *const c_void, c_uint, *mut c_int, *mut *mut c_void) -> CuResult,
+    module_load_ex: unsafe extern "C" fn(
+        *mut Handle,
+        *const c_void,
+        c_uint,
+        *mut c_int,
+        *mut *mut c_void,
+    ) -> CuResult,
     module_get_function: unsafe extern "C" fn(*mut Handle, Handle, *const c_char) -> CuResult,
     launch: unsafe extern "C" fn(
-        Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void,
+        Handle,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        Handle,
+        *mut *mut c_void,
+        *mut *mut c_void,
     ) -> CuResult,
     get_error_name: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
     get_error_string: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
@@ -89,12 +108,17 @@ unsafe impl Sync for Driver {}
 
 impl Driver {
     fn load() -> Result<Driver, String> {
-        let name = if cfg!(windows) { "nvcuda.dll" } else { "libcuda.so.1" };
+        let name = if cfg!(windows) {
+            "nvcuda.dll"
+        } else {
+            "libcuda.so.1"
+        };
         unsafe {
             let lib = Library::new(name).map_err(|e| format!("cannot load {name}: {e}"))?;
             macro_rules! sym {
                 ($n:literal) => {
-                    *lib.get(concat!($n, "\0").as_bytes()).map_err(|e| format!("missing {}: {e}", $n))?
+                    *lib.get(concat!($n, "\0").as_bytes())
+                        .map_err(|e| format!("missing {}: {e}", $n))?
                 };
             }
             Ok(Driver {
@@ -124,9 +148,17 @@ impl Driver {
     fn describe(&self, code: CuResult) -> String {
         let get = |f: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult| unsafe {
             let mut p: *const c_char = std::ptr::null();
-            if f(code, &mut p) == 0 && !p.is_null() { CStr::from_ptr(p).to_string_lossy().into_owned() } else { "?".into() }
+            if f(code, &mut p) == 0 && !p.is_null() {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            } else {
+                "?".into()
+            }
         };
-        format!("{} ({}) [code {code}]", get(self.get_error_name), get(self.get_error_string))
+        format!(
+            "{} ({}) [code {code}]",
+            get(self.get_error_name),
+            get(self.get_error_string)
+        )
     }
 
     /// Maps a driver result to our error type, with context.
@@ -134,7 +166,11 @@ impl Driver {
         if code == 0 {
             return Ok(());
         }
-        let status = if code == CUDA_ERROR_OUT_OF_MEMORY { STATUS_OUT_OF_MEMORY } else { STATUS_INTERNAL };
+        let status = if code == CUDA_ERROR_OUT_OF_MEMORY {
+            STATUS_OUT_OF_MEMORY
+        } else {
+            STATUS_INTERNAL
+        };
         err(status, format!("{what}: {}", self.describe(code)))
     }
 }
@@ -160,7 +196,20 @@ struct Blas {
     _lib: Library,
     create: unsafe extern "C" fn(*mut Handle) -> c_int,
     sgemm: unsafe extern "C" fn(
-        Handle, c_int, c_int, c_int, c_int, c_int, *const f32, CuPtr, c_int, CuPtr, c_int, *const f32, CuPtr, c_int,
+        Handle,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *const f32,
+        CuPtr,
+        c_int,
+        CuPtr,
+        c_int,
+        *const f32,
+        CuPtr,
+        c_int,
     ) -> c_int,
 }
 
@@ -194,10 +243,15 @@ impl Blas {
                     Ok(lib) => {
                         macro_rules! sym {
                             ($n:literal) => {
-                                *lib.get(concat!($n, "\0").as_bytes()).map_err(|e| format!("{c}: missing {}: {e}", $n))?
+                                *lib.get(concat!($n, "\0").as_bytes())
+                                    .map_err(|e| format!("{c}: missing {}: {e}", $n))?
                             };
                         }
-                        return Ok(Blas { create: sym!("cublasCreate_v2"), sgemm: sym!("cublasSgemm_v2"), _lib: lib });
+                        return Ok(Blas {
+                            create: sym!("cublasCreate_v2"),
+                            sgemm: sym!("cublasSgemm_v2"),
+                            _lib: lib,
+                        });
                     }
                     Err(e) => last = format!("cannot load {c}: {e}"),
                 }
@@ -262,17 +316,35 @@ fn init_dev(drv: &Driver, index: u32) -> Result<Dev, E> {
         let mut dev = 0;
         drv.check((drv.device_get)(&mut dev, index as c_int), "cuDeviceGet")?;
         let mut ctx = std::ptr::null_mut();
-        drv.check((drv.primary_retain)(&mut ctx, dev), "cuDevicePrimaryCtxRetain")?;
+        drv.check(
+            (drv.primary_retain)(&mut ctx, dev),
+            "cuDevicePrimaryCtxRetain",
+        )?;
         drv.check((drv.ctx_set_current)(ctx), "cuCtxSetCurrent")?;
-        let ptx = CString::new(PTX).map_err(|_| E { status: STATUS_INTERNAL, msg: "PTX contains NUL".into() })?;
+        let ptx = CString::new(PTX).map_err(|_| E {
+            status: STATUS_INTERNAL,
+            msg: "PTX contains NUL".into(),
+        })?;
         let mut log = vec![0u8; 8192];
         let mut opts: [c_int; 2] = [5, 6]; // ERROR_LOG_BUFFER, ERROR_LOG_BUFFER_SIZE_BYTES
-        let mut vals: [*mut c_void; 2] = [log.as_mut_ptr() as *mut c_void, log.len() as *mut c_void];
+        let mut vals: [*mut c_void; 2] =
+            [log.as_mut_ptr() as *mut c_void, log.len() as *mut c_void];
         let mut module = std::ptr::null_mut();
-        let r = (drv.module_load_ex)(&mut module, ptx.as_ptr() as *const c_void, 2, opts.as_mut_ptr(), vals.as_mut_ptr());
+        let r = (drv.module_load_ex)(
+            &mut module,
+            ptx.as_ptr() as *const c_void,
+            2,
+            opts.as_mut_ptr(),
+            vals.as_mut_ptr(),
+        );
         if r != 0 {
-            let l = CStr::from_ptr(log.as_ptr() as *const c_char).to_string_lossy().into_owned();
-            return err(STATUS_INTERNAL, format!("loading kernels PTX: {} {l}", drv.describe(r)));
+            let l = CStr::from_ptr(log.as_ptr() as *const c_char)
+                .to_string_lossy()
+                .into_owned();
+            return err(
+                STATUS_INTERNAL,
+                format!("loading kernels PTX: {} {l}", drv.describe(r)),
+            );
         }
         let get = |name: &str| -> Result<Handle, E> {
             let c = CString::new(name).unwrap();
@@ -297,16 +369,28 @@ fn init_dev(drv: &Driver, index: u32) -> Result<Dev, E> {
             let mut h: Handle = std::ptr::null_mut();
             (((b.create)(&mut h)) == 0).then(|| BlasHandle(Mutex::new(h as usize)))
         });
-        Ok(Dev { dev, ctx, f, blas, cache: Mutex::new(Cache::default()) })
+        Ok(Dev {
+            dev,
+            ctx,
+            f,
+            blas,
+            cache: Mutex::new(Cache::default()),
+        })
     }
 }
 
 /// Returns the device state (initializing on first use) with its context current on this thread.
 fn enter(index: u32) -> Result<(&'static Driver, Arc<Dev>), E> {
     static DEVS: Mutex<Vec<(u32, Arc<Dev>)>> = Mutex::new(Vec::new());
-    let drv = driver().map_err(|e| E { status: STATUS_INTERNAL, msg: e.to_string() })?;
+    let drv = driver().map_err(|e| E {
+        status: STATUS_INTERNAL,
+        msg: e.to_string(),
+    })?;
     if index >= count() {
-        return err(STATUS_INVALID_ARGUMENT, format!("no such device cuda:{index}"));
+        return err(
+            STATUS_INVALID_ARGUMENT,
+            format!("no such device cuda:{index}"),
+        );
     }
     let mut devs = DEVS.lock().unwrap_or_else(|p| p.into_inner());
     let dev = match devs.iter().find(|(i, _)| *i == index) {
@@ -328,7 +412,11 @@ fn count() -> u32 {
         catch_unwind(|| {
             let Ok(d) = driver() else { return 0 };
             let mut n = 0;
-            if unsafe { (d.device_get_count)(&mut n) } != 0 || n < 0 { 0 } else { n as u32 }
+            if unsafe { (d.device_get_count)(&mut n) } != 0 || n < 0 {
+                0
+            } else {
+                n as u32
+            }
         })
         .unwrap_or(0)
     })
@@ -400,12 +488,25 @@ unsafe extern "C" fn device_info(device: u32, out: *mut DeviceInfo) -> Status {
             return err(STATUS_INVALID_ARGUMENT, "null out");
         }
         let (drv, dev) = enter(device)?;
-        let mut info = DeviceInfo { name: [0; 64], kind: KIND_CUDA, total_memory: MEMORY_UNKNOWN, free_memory: MEMORY_UNKNOWN, flags: 0 };
+        let mut info = DeviceInfo {
+            name: [0; 64],
+            kind: KIND_CUDA,
+            total_memory: MEMORY_UNKNOWN,
+            free_memory: MEMORY_UNKNOWN,
+            flags: 0,
+        };
         unsafe {
-            drv.check((drv.device_get_name)(info.name.as_mut_ptr(), 63, dev.dev), "cuDeviceGetName")?;
+            drv.check(
+                (drv.device_get_name)(info.name.as_mut_ptr(), 63, dev.dev),
+                "cuDeviceGetName",
+            )?;
             let (mut free, mut total) = (0usize, 0usize);
             drv.check((drv.mem_get_info)(&mut free, &mut total), "cuMemGetInfo")?;
-            let cached = dev.cache.lock().unwrap_or_else(|p| p.into_inner()).cached_bytes;
+            let cached = dev
+                .cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .cached_bytes;
             info.total_memory = total as u64;
             info.free_memory = (free + cached).min(total) as u64;
             *out = info;
@@ -434,33 +535,57 @@ unsafe extern "C" fn free(device: u32, ptr: *mut c_void) {
     });
 }
 
-unsafe extern "C" fn copy_from_host(device: u32, dst: *mut c_void, src: *const c_void, bytes: usize) -> Status {
+unsafe extern "C" fn copy_from_host(
+    device: u32,
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+) -> Status {
     wrap(|| {
         let (drv, _) = enter(device)?;
         if bytes == 0 {
             return Ok(());
         }
-        drv.check(unsafe { (drv.htod)(dst as usize as CuPtr, src, bytes) }, "cuMemcpyHtoD")
+        drv.check(
+            unsafe { (drv.htod)(dst as usize as CuPtr, src, bytes) },
+            "cuMemcpyHtoD",
+        )
     })
 }
 
-unsafe extern "C" fn copy_to_host(device: u32, dst: *mut c_void, src: *const c_void, bytes: usize) -> Status {
+unsafe extern "C" fn copy_to_host(
+    device: u32,
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+) -> Status {
     wrap(|| {
         let (drv, _) = enter(device)?;
         if bytes == 0 {
             return Ok(());
         }
-        drv.check(unsafe { (drv.dtoh)(dst, src as usize as CuPtr, bytes) }, "cuMemcpyDtoH")
+        drv.check(
+            unsafe { (drv.dtoh)(dst, src as usize as CuPtr, bytes) },
+            "cuMemcpyDtoH",
+        )
     })
 }
 
-unsafe extern "C" fn copy_d2d(device: u32, dst: *mut c_void, src: *const c_void, bytes: usize) -> Status {
+unsafe extern "C" fn copy_d2d(
+    device: u32,
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+) -> Status {
     wrap(|| {
         let (drv, _) = enter(device)?;
         if bytes == 0 {
             return Ok(());
         }
-        drv.check(unsafe { (drv.dtod)(dst as usize as CuPtr, src as usize as CuPtr, bytes) }, "cuMemcpyDtoD")
+        drv.check(
+            unsafe { (drv.dtod)(dst as usize as CuPtr, src as usize as CuPtr, bytes) },
+            "cuMemcpyDtoD",
+        )
     })
 }
 
@@ -474,7 +599,11 @@ unsafe extern "C" fn synchronize(device: u32) -> Status {
 unsafe extern "C" fn last_error() -> *const c_char {
     LAST_ERROR.with(|e| {
         let e = e.borrow();
-        if e.as_bytes().is_empty() { c"cuda plugin: no error".as_ptr() } else { e.as_ptr() }
+        if e.as_bytes().is_empty() {
+            c"cuda plugin: no error".as_ptr()
+        } else {
+            e.as_ptr()
+        }
     })
 }
 
@@ -497,19 +626,27 @@ fn make_dims(shape: &[u64], strides: &[u64]) -> Result<Dims, E> {
         if s == 1 {
             continue;
         }
-        if let Some(last) = v.last_mut() {
-            if last.1 == st.wrapping_mul(s) {
-                last.0 *= s;
-                last.1 = st;
-                continue;
-            }
+        if let Some(last) = v.last_mut()
+            && last.1 == st.wrapping_mul(s)
+        {
+            last.0 *= s;
+            last.1 = st;
+            continue;
         }
         v.push((s, st));
     }
     if v.len() > 8 {
-        return err(STATUS_UNSUPPORTED, format!("tensor needs {} dims after coalescing, max 8", v.len()));
+        return err(
+            STATUS_UNSUPPORTED,
+            format!("tensor needs {} dims after coalescing, max 8", v.len()),
+        );
     }
-    let mut d = Dims { nd: v.len() as u32, contig: 0, shape: [1; 8], strides: [0; 8] };
+    let mut d = Dims {
+        nd: v.len() as u32,
+        contig: 0,
+        shape: [1; 8],
+        strides: [0; 8],
+    };
     for (i, &(s, st)) in v.iter().enumerate() {
         d.shape[i] = s;
         d.strides[i] = st;
@@ -527,18 +664,46 @@ fn p<T>(x: &mut T) -> *mut c_void {
 }
 
 impl Driver {
-    fn launch_k(&self, f: Handle, grid: (u32, u32), block: u32, params: &mut [*mut c_void], what: &str) -> Result<(), E> {
+    fn launch_k(
+        &self,
+        f: Handle,
+        grid: (u32, u32),
+        block: u32,
+        params: &mut [*mut c_void],
+        what: &str,
+    ) -> Result<(), E> {
         if grid.0 == 0 || grid.1 == 0 || grid.1 > 65535 {
-            return err(STATUS_UNSUPPORTED, format!("{what}: grid {grid:?} not launchable"));
+            return err(
+                STATUS_UNSUPPORTED,
+                format!("{what}: grid {grid:?} not launchable"),
+            );
         }
         let r = unsafe {
-            (self.launch)(f, grid.0, grid.1, 1, block, 1, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut())
+            (self.launch)(
+                f,
+                grid.0,
+                grid.1,
+                1,
+                block,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
         };
         self.check(r, &format!("launch {what}"))
     }
 
     /// 1-D grid-stride launch over `n` elements.
-    fn launch_1d(&self, f: Handle, n: u64, params: &mut [*mut c_void], what: &str) -> Result<(), E> {
+    fn launch_1d(
+        &self,
+        f: Handle,
+        n: u64,
+        params: &mut [*mut c_void],
+        what: &str,
+    ) -> Result<(), E> {
         let blocks = n.div_ceil(256).min(1 << 18) as u32;
         self.launch_k(f, (blocks, 1), 256, params, what)
     }
@@ -549,7 +714,10 @@ fn dims_of<'a>(d: &TensorDesc) -> (&'a [u64], &'a [u64]) {
         if d.ndim == 0 {
             (&[], &[])
         } else {
-            (slice::from_raw_parts(d.shape, d.ndim as usize), slice::from_raw_parts(d.strides, d.ndim as usize))
+            (
+                slice::from_raw_parts(d.shape, d.ndim as usize),
+                slice::from_raw_parts(d.strides, d.ndim as usize),
+            )
         }
     }
 }
@@ -568,27 +736,55 @@ struct Gemm {
 }
 
 fn gemm(drv: &Driver, dev: &Dev, g: Gemm) -> Result<(), E> {
-    let Gemm { a, b, out, m, n, k, ta, tb } = g;
-    if let (Some(bl), Some(h)) = (blas(), dev.blas.as_ref()) {
-        if m.max(n).max(k) <= i32::MAX as u64 {
-            // Row-major C = A*B is column-major C^T = B^T * A^T, so the operands swap. A row-major
-            // matrix read as column-major is already its transpose, so a stored operand needs the
-            // transpose flag exactly when the caller asked for the transposed one.
-            let (alpha, beta) = (1f32, 0f32);
-            let (op_b, op_a) = (tb as c_int, ta as c_int);
-            let ldb = if tb { k } else { n } as c_int;
-            let lda = if ta { m } else { k } as c_int;
-            let r = {
-                let hd = h.0.lock().unwrap_or_else(|p| p.into_inner());
-                unsafe {
-                    (bl.sgemm)(
-                        *hd as Handle, op_b, op_a, n as c_int, m as c_int, k as c_int, &alpha, b, ldb, a, lda, &beta, out,
-                        n as c_int,
-                    )
-                }
-            };
-            return if r == 0 { Ok(()) } else { err(STATUS_INTERNAL, format!("cublasSgemm failed with status {r}")) };
-        }
+    let Gemm {
+        a,
+        b,
+        out,
+        m,
+        n,
+        k,
+        ta,
+        tb,
+    } = g;
+    if let (Some(bl), Some(h)) = (blas(), dev.blas.as_ref())
+        && m.max(n).max(k) <= i32::MAX as u64
+    {
+        // Row-major C = A*B is column-major C^T = B^T * A^T, so the operands swap. A row-major
+        // matrix read as column-major is already its transpose, so a stored operand needs the
+        // transpose flag exactly when the caller asked for the transposed one.
+        let (alpha, beta) = (1f32, 0f32);
+        let (op_b, op_a) = (tb as c_int, ta as c_int);
+        let ldb = if tb { k } else { n } as c_int;
+        let lda = if ta { m } else { k } as c_int;
+        let r = {
+            let hd = h.0.lock().unwrap_or_else(|p| p.into_inner());
+            unsafe {
+                (bl.sgemm)(
+                    *hd as Handle,
+                    op_b,
+                    op_a,
+                    n as c_int,
+                    m as c_int,
+                    k as c_int,
+                    &alpha,
+                    b,
+                    ldb,
+                    a,
+                    lda,
+                    &beta,
+                    out,
+                    n as c_int,
+                )
+            }
+        };
+        return if r == 0 {
+            Ok(())
+        } else {
+            err(
+                STATUS_INTERNAL,
+                format!("cublasSgemm failed with status {r}"),
+            )
+        };
     }
     // Built-in kernel: contiguous row-major only, so materialize any transposed operand first.
     let mut scratch: Vec<CuPtr> = Vec::new();
@@ -598,7 +794,18 @@ fn gemm(drv: &Driver, dev: &Dev, g: Gemm) -> Result<(), E> {
         scratch.push(t);
         let mut d = make_dims(&[cols, rows], &[1, cols])?;
         let (mut inp, mut dst, mut nn, mut code) = (src, t, rows * cols, 7 as c_int);
-        drv.launch_1d(dev.f.unary, nn, &mut [p(&mut code), p(&mut inp), p(&mut dst), p(&mut nn), p(&mut d)], "transpose")?;
+        drv.launch_1d(
+            dev.f.unary,
+            nn,
+            &mut [
+                p(&mut code),
+                p(&mut inp),
+                p(&mut dst),
+                p(&mut nn),
+                p(&mut d),
+            ],
+            "transpose",
+        )?;
         Ok(t)
     };
     let res = (|| {
@@ -611,8 +818,27 @@ fn gemm(drv: &Driver, dev: &Dev, g: Gemm) -> Result<(), E> {
         }
         // 16x16 thread block: launch with block (16,16,1) via grid/block override.
         let r = unsafe {
-            let mut params = [p(&mut a), p(&mut b), p(&mut out), p(&mut mm), p(&mut nn), p(&mut kk)];
-            (drv.launch)(dev.f.matmul, gx, gy, 1, 16, 16, 1, 0, std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut())
+            let mut params = [
+                p(&mut a),
+                p(&mut b),
+                p(&mut out),
+                p(&mut mm),
+                p(&mut nn),
+                p(&mut kk),
+            ];
+            (drv.launch)(
+                dev.f.matmul,
+                gx,
+                gy,
+                1,
+                16,
+                16,
+                1,
+                0,
+                std::ptr::null_mut(),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
         };
         drv.check(r, "launch matmul")
     })();
@@ -623,7 +849,13 @@ fn gemm(drv: &Driver, dev: &Dev, g: Gemm) -> Result<(), E> {
     res
 }
 
-fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[TensorDesc]) -> Result<(), E> {
+fn run(
+    device: u32,
+    op_code: u32,
+    attrs: &OpAttrs,
+    ins: &[TensorDesc],
+    outs: &[TensorDesc],
+) -> Result<(), E> {
     use op::*;
     let (drv, dev) = enter(device)?;
     if outs.len() != 1 {
@@ -637,7 +869,10 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
         _ => return err(STATUS_UNSUPPORTED, format!("unsupported op {op_code}")),
     };
     if ins.len() != need {
-        return err(STATUS_INVALID_ARGUMENT, format!("op {op_code} needs {need} inputs, got {}", ins.len()));
+        return err(
+            STATUS_INVALID_ARGUMENT,
+            format!("op {op_code} needs {need} inputs, got {}", ins.len()),
+        );
     }
     if ins.iter().chain(outs).any(|d| d.dtype != DTYPE_F32) {
         return err(STATUS_UNSUPPORTED, "only f32 is supported");
@@ -658,7 +893,12 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
         }
         RAND_NORMAL => {
             let mut seed = attrs.ints[0] as u64;
-            drv.launch_1d(f.randn, n, &mut [p(&mut out), p(&mut nn), p(&mut seed)], "randn")
+            drv.launch_1d(
+                f.randn,
+                n,
+                &mut [p(&mut out), p(&mut nn), p(&mut seed)],
+                "randn",
+            )
         }
         NEG | EXP | LOG | RELU | TANH | STEP | COPY => {
             let (s, st) = dims_of(&ins[0]);
@@ -668,7 +908,18 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
             let mut d = make_dims(s, st)?;
             let mut inp = ins[0].data as usize as CuPtr;
             let mut code: c_int = if op_code == COPY { 7 } else { op_code as c_int };
-            drv.launch_1d(f.unary, n, &mut [p(&mut code), p(&mut inp), p(&mut out), p(&mut nn), p(&mut d)], "unary")
+            drv.launch_1d(
+                f.unary,
+                n,
+                &mut [
+                    p(&mut code),
+                    p(&mut inp),
+                    p(&mut out),
+                    p(&mut nn),
+                    p(&mut d),
+                ],
+                "unary",
+            )
         }
         ADD | SUB | MUL | DIV => {
             let (sa, sta) = dims_of(&ins[0]);
@@ -680,19 +931,40 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
             let (mut a, mut b) = (ins[0].data as usize as CuPtr, ins[1].data as usize as CuPtr);
             let mut code: c_int = (op_code - ADD) as c_int;
             // Contiguous same-shape operands with aligned pointers take the 128-bit path.
-            if da.contig == 1 && db.contig == 1 && n % 4 == 0 && (a | b | out) % 16 == 0 {
+            if da.contig == 1
+                && db.contig == 1
+                && n.is_multiple_of(4)
+                && (a | b | out).is_multiple_of(16)
+            {
                 let mut n4 = n / 4;
-                return drv.launch_1d(f.binary_vec, n4, &mut [p(&mut code), p(&mut a), p(&mut b), p(&mut out), p(&mut n4)], "binary_vec");
+                return drv.launch_1d(
+                    f.binary_vec,
+                    n4,
+                    &mut [p(&mut code), p(&mut a), p(&mut b), p(&mut out), p(&mut n4)],
+                    "binary_vec",
+                );
             }
             drv.launch_1d(
                 f.binary,
                 n,
-                &mut [p(&mut code), p(&mut a), p(&mut b), p(&mut out), p(&mut nn), p(&mut da), p(&mut db)],
+                &mut [
+                    p(&mut code),
+                    p(&mut a),
+                    p(&mut b),
+                    p(&mut out),
+                    p(&mut nn),
+                    p(&mut da),
+                    p(&mut db),
+                ],
                 "binary",
             )
         }
         MATMUL | MATMUL_T => {
-            let flags = if op_code == MATMUL_T { attrs.ints[0] } else { 0 };
+            let flags = if op_code == MATMUL_T {
+                attrs.ints[0]
+            } else {
+                0
+            };
             let (ta, tb) = (flags & 1 != 0, flags & 2 != 0);
             let (sa, _) = dims_of(&ins[0]);
             let (sb, _) = dims_of(&ins[1]);
@@ -705,17 +977,38 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
                 return err(STATUS_INVALID_ARGUMENT, "matmul shape mismatch");
             }
             let (a, b) = (ins[0].data as usize as CuPtr, ins[1].data as usize as CuPtr);
-            gemm(drv, &dev, Gemm { a, b, out, m, n: nc, k, ta, tb })
+            gemm(
+                drv,
+                &dev,
+                Gemm {
+                    a,
+                    b,
+                    out,
+                    m,
+                    n: nc,
+                    k,
+                    ta,
+                    tb,
+                },
+            )
         }
         AXPY => {
             let (sa, _) = dims_of(&ins[0]);
             let (sb, _) = dims_of(&ins[1]);
             if numel(sa) != n || numel(sb) != n {
-                return err(STATUS_INVALID_ARGUMENT, "axpy input shapes do not match output");
+                return err(
+                    STATUS_INVALID_ARGUMENT,
+                    "axpy input shapes do not match output",
+                );
             }
             let (mut a, mut b) = (ins[0].data as usize as CuPtr, ins[1].data as usize as CuPtr);
             let mut alpha = f32::from_bits(attrs.ints[0] as u32);
-            drv.launch_1d(f.axpy, n, &mut [p(&mut a), p(&mut b), p(&mut out), p(&mut nn), p(&mut alpha)], "axpy")
+            drv.launch_1d(
+                f.axpy,
+                n,
+                &mut [p(&mut a), p(&mut b), p(&mut out), p(&mut nn), p(&mut alpha)],
+                "axpy",
+            )
         }
         SUM_AXIS => {
             let (shape, _) = dims_of(&ins[0]);
@@ -724,7 +1017,11 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
                 return err(STATUS_INVALID_ARGUMENT, "sum axis out of range");
             }
             let axis = axis as usize;
-            let (mut outer, mut len, mut inner) = (numel(&shape[..axis]), shape[axis], numel(&shape[axis + 1..]));
+            let (mut outer, mut len, mut inner) = (
+                numel(&shape[..axis]),
+                shape[axis],
+                numel(&shape[axis + 1..]),
+            );
             let total = outer * inner;
             if total != n {
                 return err(STATUS_INVALID_ARGUMENT, "sum output shape mismatch");
@@ -732,23 +1029,44 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
             let mut x = ins[0].data as usize as CuPtr;
             if len == 0 {
                 let mut z = 0f32;
-                return drv.launch_1d(f.fill, n, &mut [p(&mut out), p(&mut nn), p(&mut z)], "fill(sum of empty)");
+                return drv.launch_1d(
+                    f.fill,
+                    n,
+                    &mut [p(&mut out), p(&mut nn), p(&mut z)],
+                    "fill(sum of empty)",
+                );
             }
             // Pick the number of chunks the reduced axis is split into (parts > 1 needs scratch).
             let (parts, chunk) = if inner == 1 {
-                let np = if outer >= 256 { 1 } else { (len / 4096).clamp(1, 1024) };
+                let np = if outer >= 256 {
+                    1
+                } else {
+                    (len / 4096).clamp(1, 1024)
+                };
                 (np, len.div_ceil(np))
             } else {
-                let np = if total >= 32768 || len <= 64 { 1 } else { (131072 / total).clamp(1, len.div_ceil(32)).min(4096) };
+                let np = if total >= 32768 || len <= 64 {
+                    1
+                } else {
+                    (131072 / total).clamp(1, len.div_ceil(32)).min(4096)
+                };
                 (np, len.div_ceil(np))
             };
             // Rows that are a multiple of 4 floats, 16-byte aligned, can be read as float4: keep every
             // chunk a multiple of 4 too so each chunk start stays aligned.
-            let mut vec: c_int = (inner == 1 && len % 4 == 0 && x % 16 == 0) as c_int;
-            let chunk = if vec == 1 { chunk.next_multiple_of(4) } else { chunk };
+            let mut vec: c_int = (inner == 1 && len % 4 == 0 && x.is_multiple_of(16)) as c_int;
+            let chunk = if vec == 1 {
+                chunk.next_multiple_of(4)
+            } else {
+                chunk
+            };
             let parts = len.div_ceil(chunk).min(parts).max(1);
             let mut chunk_v = chunk;
-            let scratch = if parts > 1 { Some(dev.alloc(drv, (parts * total * 4) as usize)?) } else { None };
+            let scratch = if parts > 1 {
+                Some(dev.alloc(drv, (parts * total * 4) as usize)?)
+            } else {
+                None
+            };
             let mut dst = scratch.unwrap_or(out);
             let res = (|| {
                 if inner == 1 {
@@ -756,7 +1074,14 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
                         f.sum_rows,
                         (outer as u32, parts as u32),
                         256,
-                        &mut [p(&mut x), p(&mut dst), p(&mut outer), p(&mut len), p(&mut chunk_v), p(&mut vec)],
+                        &mut [
+                            p(&mut x),
+                            p(&mut dst),
+                            p(&mut outer),
+                            p(&mut len),
+                            p(&mut chunk_v),
+                            p(&mut vec),
+                        ],
                         "sum_rows",
                     )
                 } else {
@@ -765,14 +1090,26 @@ fn run(device: u32, op_code: u32, attrs: &OpAttrs, ins: &[TensorDesc], outs: &[T
                         f.sum_cols,
                         (gx, parts as u32),
                         256,
-                        &mut [p(&mut x), p(&mut dst), p(&mut outer), p(&mut len), p(&mut inner), p(&mut chunk_v)],
+                        &mut [
+                            p(&mut x),
+                            p(&mut dst),
+                            p(&mut outer),
+                            p(&mut len),
+                            p(&mut inner),
+                            p(&mut chunk_v),
+                        ],
                         "sum_cols",
                     )
                 }?;
                 if scratch.is_some() {
                     let mut tot = total;
                     let mut np = parts;
-                    drv.launch_1d(f.sum_parts, total, &mut [p(&mut dst), p(&mut out), p(&mut tot), p(&mut np)], "sum_parts")?;
+                    drv.launch_1d(
+                        f.sum_parts,
+                        total,
+                        &mut [p(&mut dst), p(&mut out), p(&mut tot), p(&mut np)],
+                        "sum_parts",
+                    )?;
                 }
                 Ok(())
             })();
@@ -790,7 +1127,22 @@ unsafe extern "C" fn supports_op(code: u32) -> u32 {
     use op::*;
     matches!(
         code,
-        NEG | EXP | LOG | RELU | TANH | STEP | ADD | SUB | MUL | DIV | MATMUL | MATMUL_T | AXPY | SUM_AXIS | COPY | FILL | RAND_NORMAL
+        NEG | EXP
+            | LOG
+            | RELU
+            | TANH
+            | STEP
+            | ADD
+            | SUB
+            | MUL
+            | DIV
+            | MATMUL
+            | MATMUL_T
+            | AXPY
+            | SUM_AXIS
+            | COPY
+            | FILL
+            | RAND_NORMAL
     ) as u32
 }
 
@@ -804,9 +1156,21 @@ unsafe extern "C" fn execute(
     n_outputs: u32,
 ) -> Status {
     wrap(|| unsafe {
-        let attrs = if attrs.is_null() { OpAttrs::default() } else { *attrs };
-        let ins: &[TensorDesc] = if n_inputs == 0 { &[] } else { slice::from_raw_parts(inputs, n_inputs as usize) };
-        let outs: &[TensorDesc] = if n_outputs == 0 { &[] } else { slice::from_raw_parts(outputs, n_outputs as usize) };
+        let attrs = if attrs.is_null() {
+            OpAttrs::default()
+        } else {
+            *attrs
+        };
+        let ins: &[TensorDesc] = if n_inputs == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(inputs, n_inputs as usize)
+        };
+        let outs: &[TensorDesc] = if n_outputs == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(outputs, n_outputs as usize)
+        };
         run(device, op_code, &attrs, ins, outs)
     })
 }

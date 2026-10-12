@@ -12,16 +12,32 @@ use std::time::Instant;
 /// The plugin cdylib. `cargo test` does not build a package's cdylib, so build it on first use into
 /// the same target directory (`target/<profile>/`, one level above the test binary's `deps/`).
 fn cuda_dll() -> PathBuf {
-    let name = format!("{}pytorches_plugin_cuda.{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_EXTENSION);
-    let profile_dir = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
+    let name = format!(
+        "{}pytorches_plugin_cuda.{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_EXTENSION
+    );
+    let profile_dir = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let dll = profile_dir.join(&name);
     if !dll.exists() {
-        let mut build = std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-        build.args(["build", "--lib", "--manifest-path"]).arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        let mut build =
+            std::process::Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        build
+            .args(["build", "--lib", "--manifest-path"])
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
         if profile_dir.file_name().is_some_and(|n| n == "release") {
             build.arg("--release");
         }
-        assert!(build.status().expect("run cargo").success(), "building the plugin failed");
+        assert!(
+            build.status().expect("run cargo").success(),
+            "building the plugin failed"
+        );
     }
     dll
 }
@@ -44,7 +60,10 @@ fn devices() -> Option<(Device, Device)> {
     if !*OK.get().unwrap() {
         return None;
     }
-    Some((Device::parse("cpu:0").unwrap(), Device::parse("cuda:0").ok()?))
+    Some((
+        Device::parse("cpu:0").unwrap(),
+        Device::parse("cuda:0").ok()?,
+    ))
 }
 
 macro_rules! need_cuda {
@@ -61,10 +80,14 @@ macro_rules! need_cuda {
 
 /// Deterministic pseudo-random data in [-1, 1).
 fn data(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut s = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 40) as f32 / 8388608.0) - 1.0
         })
         .collect()
@@ -74,13 +97,19 @@ fn assert_close(what: &str, got: &[f32], want: &[f32], rtol: f32) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
         let tol = rtol * w.abs().max(1.0);
-        assert!((g - w).abs() <= tol || (g.is_nan() && w.is_nan()), "{what}[{i}]: cuda {g} vs cpu {w}");
+        assert!(
+            (g - w).abs() <= tol || (g.is_nan() && w.is_nan()),
+            "{what}[{i}]: cuda {g} vs cpu {w}"
+        );
     }
 }
 
 fn pair(shape: &[usize], seed: u64, cpu: &Device, gpu: &Device) -> (Tensor, Tensor) {
     let d = data(shape.iter().product(), seed);
-    (Tensor::from_vec_on(d.clone(), shape.to_vec(), cpu), Tensor::from_vec_on(d, shape.to_vec(), gpu))
+    (
+        Tensor::from_vec_on(d.clone(), shape.to_vec(), cpu),
+        Tensor::from_vec_on(d, shape.to_vec(), gpu),
+    )
 }
 
 #[test]
@@ -99,7 +128,10 @@ fn broadcasting_binary_ops() {
         let (ac, ag) = pair(sa, 10 + i as u64, &cpu, &gpu);
         let (bc, bg) = pair(sb, 50 + i as u64, &cpu, &gpu);
         // Keep divisors away from zero.
-        let (bc, bg) = (bc.add(&Tensor::scalar_on(2.0, &cpu)), bg.add(&Tensor::scalar_on(2.0, &gpu)));
+        let (bc, bg) = (
+            bc.add(&Tensor::scalar_on(2.0, &cpu)),
+            bg.add(&Tensor::scalar_on(2.0, &gpu)),
+        );
         for (name, f) in [
             ("add", Tensor::add as fn(&Tensor, &Tensor) -> Tensor),
             ("sub", Tensor::sub),
@@ -109,7 +141,12 @@ fn broadcasting_binary_ops() {
             let c = f(&ac, &bc);
             let g = f(&ag, &bg);
             assert_eq!(c.shape(), g.shape());
-            assert_close(&format!("{name} {sa:?}{sb:?}"), &g.to_vec(), &c.to_vec(), 1e-6);
+            assert_close(
+                &format!("{name} {sa:?}{sb:?}"),
+                &g.to_vec(),
+                &c.to_vec(),
+                1e-6,
+            );
         }
     }
 }
@@ -132,17 +169,32 @@ fn unary_ops() {
     assert_close("relu", &g.relu().to_vec(), &c.relu().to_vec(), 0.0);
     assert_close("tanh", &g.tanh().to_vec(), &c.tanh().to_vec(), 1e-5);
     assert_close("exp", &g.exp().to_vec(), &c.exp().to_vec(), 1e-5);
-    let (pc, pg) = (c.mul(&c).add(&Tensor::scalar_on(0.01, &cpu)), g.mul(&g).add(&Tensor::scalar_on(0.01, &gpu)));
+    let (pc, pg) = (
+        c.mul(&c).add(&Tensor::scalar_on(0.01, &cpu)),
+        g.mul(&g).add(&Tensor::scalar_on(0.01, &gpu)),
+    );
     assert_close("log", &pg.log().to_vec(), &pc.log().to_vec(), 1e-5);
 }
 
 #[test]
 fn matmul_sizes() {
     let (cpu, gpu) = need_cuda!();
-    for (m, k, n) in [(33, 65, 17), (1, 1, 1), (5, 129, 130), (128, 8, 128), (512, 512, 512), (7, 300, 1)] {
+    for (m, k, n) in [
+        (33, 65, 17),
+        (1, 1, 1),
+        (5, 129, 130),
+        (128, 8, 128),
+        (512, 512, 512),
+        (7, 300, 1),
+    ] {
         let (ac, ag) = pair(&[m, k], 1, &cpu, &gpu);
         let (bc, bg) = pair(&[k, n], 2, &cpu, &gpu);
-        assert_close(&format!("matmul {m}x{k}x{n}"), &ag.matmul(&bg).to_vec(), &ac.matmul(&bc).to_vec(), 2e-4);
+        assert_close(
+            &format!("matmul {m}x{k}x{n}"),
+            &ag.matmul(&bg).to_vec(),
+            &ac.matmul(&bc).to_vec(),
+            2e-4,
+        );
     }
 }
 
@@ -151,10 +203,22 @@ fn matmul_gradients_odd_shapes() {
     // Backward uses MATMUL_T (transposed operands), so check non-square shapes where a wrong flag or
     // leading dimension cannot cancel out. Both inputs need gradients here.
     let (cpu, gpu) = need_cuda!();
-    for (m, k, n) in [(33, 65, 17), (1, 1, 1), (5, 129, 130), (7, 300, 1), (1, 40, 64)] {
+    for (m, k, n) in [
+        (33, 65, 17),
+        (1, 1, 1),
+        (5, 129, 130),
+        (7, 300, 1),
+        (1, 40, 64),
+    ] {
         let run = |dev: &Device| {
-            let mk = |shape: &[usize], seed| Tensor::from_vec_on(data(shape.iter().product(), seed), shape.to_vec(), dev);
-            let (a, b, w) = (mk(&[m, k], 1).requires_grad_(true), mk(&[k, n], 2).requires_grad_(true), mk(&[m, n], 3));
+            let mk = |shape: &[usize], seed| {
+                Tensor::from_vec_on(data(shape.iter().product(), seed), shape.to_vec(), dev)
+            };
+            let (a, b, w) = (
+                mk(&[m, k], 1).requires_grad_(true),
+                mk(&[k, n], 2).requires_grad_(true),
+                mk(&[m, n], 3),
+            );
             a.matmul(&b).mul(&w).sum().backward();
             vec![a.grad().unwrap().to_vec(), b.grad().unwrap().to_vec()]
         };
@@ -191,24 +255,64 @@ fn vectorized_paths_match_cpu() {
     // The 128-bit binary and row-sum kernels only run for lengths that are a multiple of 4; check both
     // sides of that boundary, single-chunk and many-chunk reductions, and 2-D rows.
     let (cpu, gpu) = need_cuda!();
-    for n in [4usize, 7, 8, 1000, 4096, 4100, 65537, 1 << 20, (1 << 22) + 4, (1 << 22) + 3] {
+    for n in [
+        4usize,
+        7,
+        8,
+        1000,
+        4096,
+        4100,
+        65537,
+        1 << 20,
+        (1 << 22) + 4,
+        (1 << 22) + 3,
+    ] {
         let (ac, ag) = pair(&[n], 1, &cpu, &gpu);
         let (bc, bg) = pair(&[n], 2, &cpu, &gpu);
-        assert_close(&format!("add n={n}"), &ag.add(&bg).to_vec(), &ac.add(&bc).to_vec(), 1e-6);
-        assert_close(&format!("div n={n}"), &ag.div(&bg.add(&bg.mul(&bg)).add(&Tensor::scalar_on(2.0, &gpu))).to_vec(),
-            &ac.div(&bc.add(&bc.mul(&bc)).add(&Tensor::scalar_on(2.0, &cpu))).to_vec(), 1e-5);
-        assert_close(&format!("sum n={n}"), &ag.sum().to_vec(), &ac.sum().to_vec(), 1e-3);
+        assert_close(
+            &format!("add n={n}"),
+            &ag.add(&bg).to_vec(),
+            &ac.add(&bc).to_vec(),
+            1e-6,
+        );
+        assert_close(
+            &format!("div n={n}"),
+            &ag.div(&bg.add(&bg.mul(&bg)).add(&Tensor::scalar_on(2.0, &gpu)))
+                .to_vec(),
+            &ac.div(&bc.add(&bc.mul(&bc)).add(&Tensor::scalar_on(2.0, &cpu)))
+                .to_vec(),
+            1e-5,
+        );
+        assert_close(
+            &format!("sum n={n}"),
+            &ag.sum().to_vec(),
+            &ac.sum().to_vec(),
+            1e-3,
+        );
     }
     // d/d(bias[r]) of sum(w * (x + bias)) is the row sum of w, reduced over the last axis (inner == 1).
-    for (rows, cols) in [(3usize, 8usize), (5, 6), (256, 4096), (300, 1000), (1, 1 << 16)] {
+    for (rows, cols) in [
+        (3usize, 8usize),
+        (5, 6),
+        (256, 4096),
+        (300, 1000),
+        (1, 1 << 16),
+    ] {
         let run = |dev: &Device| {
-            let mk = |shape: &[usize], seed| Tensor::from_vec_on(data(shape.iter().product(), seed), shape.to_vec(), dev);
+            let mk = |shape: &[usize], seed| {
+                Tensor::from_vec_on(data(shape.iter().product(), seed), shape.to_vec(), dev)
+            };
             let (x, w) = (mk(&[rows, cols], 3), mk(&[rows, cols], 4));
             let bias = mk(&[rows, 1], 5).requires_grad_(true);
             x.add(&bias).mul(&w).sum().backward();
             bias.grad().unwrap().to_vec()
         };
-        assert_close(&format!("rowsum {rows}x{cols}"), &run(&gpu), &run(&cpu), 1e-3);
+        assert_close(
+            &format!("rowsum {rows}x{cols}"),
+            &run(&gpu),
+            &run(&cpu),
+            1e-3,
+        );
     }
 }
 
@@ -218,8 +322,18 @@ fn sums_and_means() {
     // sum() reduces a flat tensor (inner == 1); big ones exercise the multi-block path.
     for n in [1usize, 7, 1000, 100_000, 3_000_001] {
         let (c, g) = pair(&[n], 4, &cpu, &gpu);
-        assert_close(&format!("sum {n}"), &g.sum().to_vec(), &c.sum().to_vec(), 1e-3 + 1e-6 * n as f32);
-        assert_close(&format!("mean {n}"), &g.mean().to_vec(), &c.mean().to_vec(), 1e-4);
+        assert_close(
+            &format!("sum {n}"),
+            &g.sum().to_vec(),
+            &c.sum().to_vec(),
+            1e-3 + 1e-6 * n as f32,
+        );
+        assert_close(
+            &format!("mean {n}"),
+            &g.mean().to_vec(),
+            &c.mean().to_vec(),
+            1e-4,
+        );
     }
     // Axis sums happen through broadcast backward: inner > 1, small/large totals, 3-D.
     for (sa, sb) in [
@@ -234,8 +348,18 @@ fn sums_and_means() {
         let (ag, bg) = (ag.requires_grad_(true), bg.requires_grad_(true));
         ac.add(&bc).sum().backward();
         ag.add(&bg).sum().backward();
-        assert_close("grad b", &bg.grad().unwrap().to_vec(), &bc.grad().unwrap().to_vec(), 1e-5);
-        assert_close("grad a", &ag.grad().unwrap().to_vec(), &ac.grad().unwrap().to_vec(), 0.0);
+        assert_close(
+            "grad b",
+            &bg.grad().unwrap().to_vec(),
+            &bc.grad().unwrap().to_vec(),
+            1e-5,
+        );
+        assert_close(
+            "grad a",
+            &ag.grad().unwrap().to_vec(),
+            &ac.grad().unwrap().to_vec(),
+            0.0,
+        );
     }
 }
 
@@ -243,10 +367,16 @@ fn sums_and_means() {
 fn randn_fill_golden() {
     let (cpu, gpu) = need_cuda!();
     let v = Tensor::randn_on(&[4], 1234, &gpu).to_vec();
-    for (got, want) in v.iter().zip([0.6574781f32, -0.08203645, -2.2065563, 0.70945626]) {
+    for (got, want) in v
+        .iter()
+        .zip([0.6574781f32, -0.08203645, -2.2065563, 0.70945626])
+    {
         assert!((got - want).abs() < 1e-4, "{v:?}");
     }
-    let (g, c) = (Tensor::randn_on(&[100_000], 99, &gpu), Tensor::randn_on(&[100_000], 99, &cpu));
+    let (g, c) = (
+        Tensor::randn_on(&[100_000], 99, &gpu),
+        Tensor::randn_on(&[100_000], 99, &cpu),
+    );
     assert_close("randn vs cpu", &g.to_vec(), &c.to_vec(), 1e-4);
     assert_eq!(Tensor::full_on(&[3, 5], 2.5, &gpu).to_vec(), vec![2.5; 15]);
     assert_eq!(Tensor::zeros_on(&[1], &gpu).to_vec(), vec![0.0]);
@@ -259,7 +389,9 @@ fn randn_fill_golden() {
 fn mlp_gradients_match() {
     let (cpu, gpu) = need_cuda!();
     let run = |dev: &Device| {
-        let mk = |shape: &[usize], seed| Tensor::from_vec_on(data(shape.iter().product(), seed), shape.to_vec(), dev);
+        let mk = |shape: &[usize], seed| {
+            Tensor::from_vec_on(data(shape.iter().product(), seed), shape.to_vec(), dev)
+        };
         let x = mk(&[32, 10], 1);
         let t = mk(&[32, 3], 2);
         let w1 = mk(&[10, 20], 3).requires_grad_(true);
@@ -268,7 +400,12 @@ fn mlp_gradients_match() {
         let diff = x.matmul(&w1).add(&b1).relu().matmul(&w2).sub(&t);
         let loss = diff.mul(&diff).mean();
         loss.backward();
-        vec![loss.to_vec(), w1.grad().unwrap().to_vec(), b1.grad().unwrap().to_vec(), w2.grad().unwrap().to_vec()]
+        vec![
+            loss.to_vec(),
+            w1.grad().unwrap().to_vec(),
+            b1.grad().unwrap().to_vec(),
+            w2.grad().unwrap().to_vec(),
+        ]
     };
     let (c, g) = (run(&cpu), run(&gpu));
     for (i, (gv, cv)) in g.iter().zip(&c).enumerate() {
@@ -304,7 +441,9 @@ fn out_of_memory_is_a_status_not_a_crash() {
         let mut p = std::ptr::null_mut();
         let st = (vt.alloc)(0, 64usize << 30, &mut p);
         assert_eq!(st, abi::STATUS_OUT_OF_MEMORY);
-        let msg = std::ffi::CStr::from_ptr((vt.last_error)()).to_string_lossy().into_owned();
+        let msg = std::ffi::CStr::from_ptr((vt.last_error)())
+            .to_string_lossy()
+            .into_owned();
         eprintln!("oom message: {msg}");
         assert!(msg.contains("OUT_OF_MEMORY"), "{msg}");
         // The device still works afterwards.
@@ -331,7 +470,12 @@ fn benchmark() {
     gpu.synchronize();
     let dt = t0.elapsed().as_secs_f64() / iters as f64;
     let flops = 2.0 * (n as f64).powi(3);
-    eprintln!("BENCH matmul {n}^3: {:.2} ms, {:.0} GFLOPs (c[0]={})", dt * 1e3, flops / dt / 1e9, c.to_vec()[0]);
+    eprintln!(
+        "BENCH matmul {n}^3: {:.2} ms, {:.0} GFLOPs (c[0]={})",
+        dt * 1e3,
+        flops / dt / 1e9,
+        c.to_vec()[0]
+    );
 
     let m = 64usize << 20; // 64M floats = 256 MiB per tensor
     let x = Tensor::randn_on(&[m], 3, &gpu);
@@ -345,11 +489,21 @@ fn benchmark() {
     }
     gpu.synchronize();
     let dt = t0.elapsed().as_secs_f64() / 10.0;
-    eprintln!("BENCH add {m} f32: {:.2} ms, {:.0} GB/s (z[0]={})", dt * 1e3, 12.0 * m as f64 / dt / 1e9, z.to_vec()[0]);
+    eprintln!(
+        "BENCH add {m} f32: {:.2} ms, {:.0} GB/s (z[0]={})",
+        dt * 1e3,
+        12.0 * m as f64 / dt / 1e9,
+        z.to_vec()[0]
+    );
 
     let t0 = Instant::now();
     let s = x.sum();
     gpu.synchronize();
     let dt = t0.elapsed().as_secs_f64();
-    eprintln!("BENCH sum {m} f32: {:.2} ms, {:.0} GB/s (s={})", dt * 1e3, 4.0 * m as f64 / dt / 1e9, s.item());
+    eprintln!(
+        "BENCH sum {m} f32: {:.2} ms, {:.0} GB/s (s={})",
+        dt * 1e3,
+        4.0 * m as f64 / dt / 1e9,
+        s.item()
+    );
 }

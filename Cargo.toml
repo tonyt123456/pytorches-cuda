@@ -1,7 +1,7 @@
 [package]
 name = "pytorches-plugin-cuda"
 description = "NVIDIA CUDA plugin for PyTorches (driver API loaded at runtime; no toolkit needed)"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/tonyt123456/pytorches-cuda"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytorches-cuda"
-version = "0.1.0"
+version = "0.1.1"
 description = "NVIDIA CUDA backend for PyTorches (loads the CUDA driver at runtime; no toolkit needed)"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,0 +1,6 @@
+# Develop against a local checkout of the main project instead of its git main branch.
+# Copy to .cargo/config.toml (gitignored) and adjust the path.
+[patch."https://github.com/tonyt123456/pytorches"]
+pytorches-plugin-abi = { path = "../pytorches/crates/plugin-abi" }
+pytorches-core = { path = "../pytorches/crates/core" }
+pytorches-plugin-cpu = { path = "../pytorches/plugins/cpu" }

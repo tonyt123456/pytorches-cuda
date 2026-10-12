@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytorches-cuda"
+version = "0.1.0"
+description = "NVIDIA CUDA backend for PyTorches (loads the CUDA driver at runtime; no toolkit needed)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["pytorches-universe"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Rust",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/tonyt123456/pytorches-cuda"
+
+# pytorches finds this package through the entry point, locates its directory (without importing
+# it) and loads pytorches_plugin_cuda.{dll,so,dylib} and its manifest from there.
+[project.entry-points."pytorches.plugins"]
+cuda = "pytorches_cuda"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+packages = ["pytorches_cuda"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+pytorches_cuda = ["pytorches_plugin_cuda.*", "libpytorches_plugin_cuda.*"]

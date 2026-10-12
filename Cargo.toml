@@ -1,0 +1,22 @@
+[package]
+name = "pytorches-plugin-cuda"
+description = "NVIDIA CUDA plugin for PyTorches (driver API loaded at runtime; no toolkit needed)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/tonyt123456/pytorches-cuda"
+
+[lib]
+name = "pytorches_plugin_cuda"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The plugin ABI is the only thing a plugin needs from the main project.
+pytorches-plugin-abi = { git = "https://github.com/tonyt123456/pytorches", branch = "main" }
+libloading = "0.8"
+
+[dev-dependencies]
+# Conformance tests drive the plugin through the core, against the CPU plugin as the oracle.
+pytorches-core = { git = "https://github.com/tonyt123456/pytorches", branch = "main" }
+pytorches-plugin-cpu = { git = "https://github.com/tonyt123456/pytorches", branch = "main" }
+

@@ -3,6 +3,8 @@
 //
 // All indexing is 64-bit. Elementwise kernels use grid-stride loops.
 
+#include <cuda_fp16.h>
+
 typedef unsigned long long u64;
 typedef long long i64;
 
@@ -45,6 +47,35 @@ extern "C" __global__ void unary_k(int op, const float* __restrict__ in, float* 
             default: r = v; break;
         }
         out[i] = r;
+    }
+}
+
+// Element conversion between f32 (0), f16 (1) and bf16 (2). `in` is read through `d` (any strides),
+// `out` is contiguous. bf16 is done by hand (round to nearest even) so the PTX stays valid for sm_75.
+__device__ __forceinline__ float load_any(const unsigned char* p, int dt, u64 i) {
+    if (dt == 0) return ((const float*)p)[i];
+    if (dt == 1) return __half2float(((const __half*)p)[i]);
+    return __uint_as_float(((unsigned int)((const unsigned short*)p)[i]) << 16);
+}
+
+__device__ __forceinline__ void store_any(unsigned char* p, int dt, u64 i, float v) {
+    if (dt == 0) {
+        ((float*)p)[i] = v;
+    } else if (dt == 1) {
+        ((__half*)p)[i] = __float2half_rn(v);
+    } else {
+        unsigned int b = __float_as_uint(v);
+        unsigned short r = isnan(v) ? (unsigned short)((b >> 16) | 0x40u)
+                                    : (unsigned short)((b + 0x7FFFu + ((b >> 16) & 1u)) >> 16);
+        ((unsigned short*)p)[i] = r;
+    }
+}
+
+extern "C" __global__ void convert_k(const unsigned char* __restrict__ in, int in_dt, unsigned char* __restrict__ out,
+                                     int out_dt, u64 n, Dims d) {
+    u64 stride = (u64)gridDim.x * blockDim.x;
+    for (u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        store_any(out, out_dt, i, load_any(in, in_dt, offset_of(d, i)));
     }
 }
 

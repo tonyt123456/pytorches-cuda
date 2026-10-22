@@ -195,6 +195,29 @@ fn driver() -> Result<&'static Driver, &'static str> {
 struct Blas {
     _lib: Library,
     create: unsafe extern "C" fn(*mut Handle) -> c_int,
+    /// `cublasGemmEx`: (handle, transa, transb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C,
+    /// Ctype, ldc, computeType, algo). Used for f16/bf16 with f32 accumulation.
+    gemm_ex: unsafe extern "C" fn(
+        Handle,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *const c_void,
+        CuPtr,
+        c_int,
+        c_int,
+        CuPtr,
+        c_int,
+        c_int,
+        *const c_void,
+        CuPtr,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+    ) -> c_int,
     sgemm: unsafe extern "C" fn(
         Handle,
         c_int,
@@ -250,6 +273,7 @@ impl Blas {
                         return Ok(Blas {
                             create: sym!("cublasCreate_v2"),
                             sgemm: sym!("cublasSgemm_v2"),
+                            gemm_ex: sym!("cublasGemmEx"),
                             _lib: lib,
                         });
                     }
@@ -294,6 +318,7 @@ struct Funcs {
     binary2d: Handle,
     transpose: Handle,
     fill: Handle,
+    convert: Handle,
     randn: Handle,
     matmul: Handle,
     axpy: Handle,
@@ -361,6 +386,7 @@ fn init_dev(drv: &Driver, index: u32) -> Result<Dev, E> {
             binary2d: get("binary2d_k")?,
             transpose: get("transpose_k")?,
             fill: get("fill_k")?,
+            convert: get("convert_k")?,
             randn: get("randn_k")?,
             matmul: get("matmul_k")?,
             axpy: get("axpy_k")?,
@@ -888,6 +914,143 @@ fn gemm(drv: &Driver, dev: &Dev, g: Gemm) -> Result<(), E> {
     res
 }
 
+/// `out[m,n] = op(a) x op(b)` on f16/bf16 data through cuBLAS (tensor cores, f32 accumulation).
+fn gemm_half(drv: &Driver, dev: &Dev, g: Gemm, dtype: u32) -> Result<(), E> {
+    let (Some(bl), Some(h)) = (blas(), dev.blas.as_ref()) else {
+        return err(STATUS_UNSUPPORTED, "half-precision matmul needs cuBLAS");
+    };
+    let _ = drv;
+    let Gemm { a, b, out, m, n, k, ta, tb } = g;
+    if m.max(n).max(k) > i32::MAX as u64 {
+        return err(STATUS_UNSUPPORTED, "matmul too large for cuBLAS");
+    }
+    // cudaDataType: CUDA_R_16F = 2, CUDA_R_16BF = 14. Compute type CUBLAS_COMPUTE_32F = 68.
+    let dt: c_int = if dtype == DTYPE_BF16 { 14 } else { 2 };
+    let (alpha, beta) = (1f32, 0f32);
+    let (op_b, op_a) = (tb as c_int, ta as c_int);
+    let ldb = if tb { k } else { n } as c_int;
+    let lda = if ta { m } else { k } as c_int;
+    let r = {
+        let hd = h.0.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe {
+            (bl.gemm_ex)(
+                *hd as Handle,
+                op_b,
+                op_a,
+                n as c_int,
+                m as c_int,
+                k as c_int,
+                &alpha as *const f32 as *const c_void,
+                b,
+                dt,
+                ldb,
+                a,
+                dt,
+                lda,
+                &beta as *const f32 as *const c_void,
+                out,
+                dt,
+                n as c_int,
+                68,
+                -1,
+            )
+        }
+    };
+    if r == 0 { Ok(()) } else { err(STATUS_INTERNAL, format!("cublasGemmEx failed with status {r}")) }
+}
+
+fn contiguous_strides(shape: &[u64]) -> Vec<u64> {
+    let mut st = vec![0u64; shape.len()];
+    let mut acc = 1u64;
+    for i in (0..shape.len()).rev() {
+        st[i] = acc;
+        acc *= shape[i];
+    }
+    st
+}
+
+/// `CONVERT`: input read through its shape/strides, contiguous output of another (or the same) dtype.
+fn convert_op(drv: &Driver, dev: &Dev, input: &TensorDesc, output: &TensorDesc) -> Result<(), E> {
+    if dtype_size(input.dtype) == 0 || dtype_size(output.dtype) == 0 {
+        return err(STATUS_UNSUPPORTED, "convert: unknown dtype");
+    }
+    let (s, st) = dims_of(input);
+    let (os, _) = dims_of(output);
+    if s != os {
+        return err(STATUS_INVALID_ARGUMENT, "convert: shapes differ");
+    }
+    let n = numel(s);
+    if n == 0 {
+        return Ok(());
+    }
+    let mut d = make_dims(s, st)?;
+    let (mut inp, mut out) = (input.data as usize as CuPtr, output.data as usize as CuPtr);
+    let (mut idt, mut odt, mut nn) = (input.dtype as c_int, output.dtype as c_int, n);
+    drv.launch_1d(
+        dev.f.convert,
+        n,
+        &mut [p(&mut inp), p(&mut idt), p(&mut out), p(&mut odt), p(&mut nn), p(&mut d)],
+        "convert",
+    )
+}
+
+/// Runs an f32 op on widened copies of f16/bf16 operands and rounds the result back. Simple and
+/// correct for every op; matmuls take the tensor-core path instead (`gemm_half`).
+fn run_staged(
+    drv: &Driver,
+    dev: &Dev,
+    device: u32,
+    op_code: u32,
+    attrs: &OpAttrs,
+    ins: &[TensorDesc],
+    outs: &[TensorDesc],
+) -> Result<(), E> {
+    let dtype = outs[0].dtype;
+    if dtype_size(dtype) == 0 || ins.iter().any(|d| dtype_size(d.dtype) == 0) {
+        return err(STATUS_UNSUPPORTED, "unknown dtype");
+    }
+    if ins.iter().any(|d| d.dtype != dtype) {
+        return err(STATUS_INVALID_ARGUMENT, "mixed dtypes in one op");
+    }
+    let mut scratch: Vec<CuPtr> = Vec::new();
+    let res = (|| {
+        let strides: Vec<Vec<u64>> = ins.iter().map(|d| contiguous_strides(dims_of(d).0)).collect();
+        let mut f32_ins: Vec<TensorDesc> = Vec::new();
+        for (d, st) in ins.iter().zip(&strides) {
+            let (s, _) = dims_of(d);
+            let tmp = dev.alloc(drv, (numel(s) * 4).max(4) as usize)?;
+            scratch.push(tmp);
+            let widened = TensorDesc {
+                data: tmp as usize as *mut c_void,
+                dtype: DTYPE_F32,
+                ndim: d.ndim,
+                shape: d.shape,
+                strides: st.as_ptr(),
+            };
+            convert_op(drv, dev, d, &widened)?;
+            f32_ins.push(widened);
+        }
+        let (os, _) = dims_of(&outs[0]);
+        let ost = contiguous_strides(os);
+        let tmp = dev.alloc(drv, (numel(os) * 4).max(4) as usize)?;
+        scratch.push(tmp);
+        let f32_out = TensorDesc {
+            data: tmp as usize as *mut c_void,
+            dtype: DTYPE_F32,
+            ndim: outs[0].ndim,
+            shape: outs[0].shape,
+            strides: ost.as_ptr(),
+        };
+        run(device, op_code, attrs, &f32_ins, std::slice::from_ref(&f32_out))?;
+        convert_op(drv, dev, &f32_out, &outs[0])
+    })();
+    // Stream ordering makes it safe to recycle the scratch right away.
+    for t in scratch {
+        dev.release(t);
+    }
+    res
+}
+
 fn run(
     device: u32,
     op_code: u32,
@@ -901,7 +1064,7 @@ fn run(
         return err(STATUS_INVALID_ARGUMENT, "expected exactly one output");
     }
     let need = match op_code {
-        NEG | EXP | LOG | RELU | TANH | STEP | COPY => 1,
+        NEG | EXP | LOG | RELU | TANH | STEP | COPY | CONVERT => 1,
         ADD | SUB | MUL | DIV | MATMUL | MATMUL_T | AXPY => 2,
         SUM_AXIS => 1,
         FILL | RAND_NORMAL => 0,
@@ -913,8 +1076,46 @@ fn run(
             format!("op {op_code} needs {need} inputs, got {}", ins.len()),
         );
     }
+    if op_code == CONVERT {
+        return convert_op(drv, &dev, &ins[0], &outs[0]);
+    }
     if ins.iter().chain(outs).any(|d| d.dtype != DTYPE_F32) {
-        return err(STATUS_UNSUPPORTED, "only f32 is supported");
+        let dt = outs[0].dtype;
+        if matches!(op_code, MATMUL | MATMUL_T)
+            && (dt == DTYPE_F16 || dt == DTYPE_BF16)
+            && ins.iter().all(|d| d.dtype == dt)
+            && blas().is_some()
+            && dev.blas.is_some()
+        {
+            let flags = if op_code == MATMUL_T { attrs.ints[0] } else { 0 };
+            let (ta, tb) = (flags & 1 != 0, flags & 2 != 0);
+            let (sa, _) = dims_of(&ins[0]);
+            let (sb, _) = dims_of(&ins[1]);
+            if sa.len() != 2 || sb.len() != 2 {
+                return err(STATUS_INVALID_ARGUMENT, "matmul needs 2-D inputs");
+            }
+            let (m, k) = if ta { (sa[1], sa[0]) } else { (sa[0], sa[1]) };
+            let (kb, nc) = if tb { (sb[1], sb[0]) } else { (sb[0], sb[1]) };
+            let n = numel(dims_of(&outs[0]).0);
+            if k != kb || n != m * nc {
+                return err(STATUS_INVALID_ARGUMENT, "matmul shape mismatch");
+            }
+            if n == 0 {
+                return Ok(());
+            }
+            let g = Gemm {
+                a: ins[0].data as usize as CuPtr,
+                b: ins[1].data as usize as CuPtr,
+                out: outs[0].data as usize as CuPtr,
+                m,
+                n: nc,
+                k,
+                ta,
+                tb,
+            };
+            return gemm_half(drv, &dev, g, dt);
+        }
+        return run_staged(drv, &dev, device, op_code, attrs, ins, outs);
     }
     let (oshape, _) = dims_of(&outs[0]);
     let n = numel(oshape);
@@ -1208,7 +1409,9 @@ unsafe extern "C" fn supports_op(code: u32) -> u32 {
     use op::*;
     matches!(
         code,
-        NEG | EXP
+        CONVERT
+            | NEG
+            | EXP
             | LOG
             | RELU
             | TANH
@@ -1225,6 +1428,14 @@ unsafe extern "C" fn supports_op(code: u32) -> u32 {
             | FILL
             | RAND_NORMAL
     ) as u32
+}
+
+/// f32 natively; f16/bf16 for every op (matmul on tensor cores, the rest on widened copies).
+unsafe extern "C" fn supports_op_dtype(code: u32, dtype: u32) -> u32 {
+    match dtype {
+        DTYPE_F32 | DTYPE_F16 | DTYPE_BF16 => unsafe { supports_op(code) },
+        _ => 0,
+    }
 }
 
 unsafe extern "C" fn execute(
@@ -1272,6 +1483,7 @@ static VTABLE: PluginVTable = PluginVTable {
     execute,
     synchronize,
     last_error,
+    supports_op_dtype: Some(supports_op_dtype),
 };
 
 #[unsafe(no_mangle)]

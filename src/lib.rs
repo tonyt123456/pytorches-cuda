@@ -62,6 +62,24 @@ type CuDevice = c_int;
 type CuPtr = u64;
 type Handle = *mut c_void;
 const CUDA_ERROR_OUT_OF_MEMORY: CuResult = 2;
+const CUDA_ERROR_NOT_READY: CuResult = 600;
+/// `CU_STREAM_NON_BLOCKING`: explicit streams must not synchronize with the legacy default stream,
+/// because the plugin contract (docs/plugin-abi.md 5.1) orders stream 0 against others only by events.
+const CU_STREAM_NON_BLOCKING: c_uint = 1;
+/// `CU_EVENT_DISABLE_TIMING`.
+const CU_EVENT_DISABLE_TIMING: c_uint = 2;
+/// `CU_MEMHOSTALLOC_PORTABLE`: pinned memory usable from every device's context.
+const CU_MEMHOSTALLOC_PORTABLE: c_uint = 1;
+
+thread_local! {
+    /// The stream `execute_on` is running an op on (0: the default stream). Kernel launches and cuBLAS
+    /// calls read it, so none of the op code needs a stream parameter.
+    static CUR_STREAM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn cur_stream() -> Handle {
+    CUR_STREAM.with(|c| c.get()) as Handle
+}
 
 struct Driver {
     _lib: Library,
@@ -101,6 +119,19 @@ struct Driver {
     ) -> CuResult,
     get_error_name: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
     get_error_string: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
+    stream_create: unsafe extern "C" fn(*mut Handle, c_uint) -> CuResult,
+    stream_destroy: unsafe extern "C" fn(Handle) -> CuResult,
+    stream_synchronize: unsafe extern "C" fn(Handle) -> CuResult,
+    stream_wait_event: unsafe extern "C" fn(Handle, Handle, c_uint) -> CuResult,
+    event_create: unsafe extern "C" fn(*mut Handle, c_uint) -> CuResult,
+    event_destroy: unsafe extern "C" fn(Handle) -> CuResult,
+    event_record: unsafe extern "C" fn(Handle, Handle) -> CuResult,
+    event_query: unsafe extern "C" fn(Handle) -> CuResult,
+    event_synchronize: unsafe extern "C" fn(Handle) -> CuResult,
+    htod_async: unsafe extern "C" fn(CuPtr, *const c_void, usize, Handle) -> CuResult,
+    dtoh_async: unsafe extern "C" fn(*mut c_void, CuPtr, usize, Handle) -> CuResult,
+    host_alloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CuResult,
+    host_free: unsafe extern "C" fn(*mut c_void) -> CuResult,
 }
 
 unsafe impl Send for Driver {}
@@ -140,6 +171,19 @@ impl Driver {
                 launch: sym!("cuLaunchKernel"),
                 get_error_name: sym!("cuGetErrorName"),
                 get_error_string: sym!("cuGetErrorString"),
+                stream_create: sym!("cuStreamCreate"),
+                stream_destroy: sym!("cuStreamDestroy_v2"),
+                stream_synchronize: sym!("cuStreamSynchronize"),
+                stream_wait_event: sym!("cuStreamWaitEvent"),
+                event_create: sym!("cuEventCreate"),
+                event_destroy: sym!("cuEventDestroy_v2"),
+                event_record: sym!("cuEventRecord"),
+                event_query: sym!("cuEventQuery"),
+                event_synchronize: sym!("cuEventSynchronize"),
+                htod_async: sym!("cuMemcpyHtoDAsync_v2"),
+                dtoh_async: sym!("cuMemcpyDtoHAsync_v2"),
+                host_alloc: sym!("cuMemHostAlloc"),
+                host_free: sym!("cuMemFreeHost"),
                 _lib: lib,
             })
         }
@@ -195,6 +239,8 @@ fn driver() -> Result<&'static Driver, &'static str> {
 struct Blas {
     _lib: Library,
     create: unsafe extern "C" fn(*mut Handle) -> c_int,
+    /// `cublasSetStream_v2(handle, stream)`.
+    set_stream: unsafe extern "C" fn(Handle, Handle) -> c_int,
     /// `cublasGemmEx`: (handle, transa, transb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C,
     /// Ctype, ldc, computeType, algo). Used for f16/bf16 with f32 accumulation.
     gemm_ex: unsafe extern "C" fn(
@@ -272,6 +318,7 @@ impl Blas {
                         }
                         return Ok(Blas {
                             create: sym!("cublasCreate_v2"),
+                            set_stream: sym!("cublasSetStream_v2"),
                             sgemm: sym!("cublasSgemm_v2"),
                             gemm_ex: sym!("cublasGemmEx"),
                             _lib: lib,
@@ -327,12 +374,25 @@ struct Funcs {
     sum_parts: Handle,
 }
 
+/// A freed block that explicit streams may still be using: it joins the cache once every event
+/// (recorded on the default stream and on each live explicit stream at `free` time) has completed.
+struct Pending {
+    ptr: CuPtr,
+    size: usize,
+    events: Vec<usize>,
+}
+
 struct Dev {
     dev: CuDevice,
     ctx: Handle,
     f: Funcs,
     blas: Option<BlasHandle>,
     cache: Mutex<Cache>,
+    /// Live explicit streams (handles as integers).
+    streams: Mutex<Vec<usize>>,
+    pending: Mutex<Vec<Pending>>,
+    /// Recycled events for `Pending`.
+    spare_events: Mutex<Vec<usize>>,
 }
 
 unsafe impl Send for Dev {}
@@ -405,6 +465,9 @@ fn init_dev(drv: &Driver, index: u32) -> Result<Dev, E> {
             f,
             blas,
             cache: Mutex::new(Cache::default()),
+            streams: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+            spare_events: Mutex::new(Vec::new()),
         })
     }
 }
@@ -474,9 +537,30 @@ impl Dev {
         }
     }
 
+    /// Moves pending blocks whose events have all completed into the cache. With `wait`, blocks on them.
+    fn reap(&self, drv: &Driver, c: &mut Cache, wait: bool) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.is_empty() {
+            return;
+        }
+        let mut spare = self.spare_events.lock().unwrap_or_else(|p| p.into_inner());
+        pending.retain(|b| {
+            let done = b.events.iter().all(|&e| unsafe {
+                if wait { (drv.event_synchronize)(e as Handle) == 0 } else { (drv.event_query)(e as Handle) == 0 }
+            });
+            if done {
+                spare.extend(b.events.iter().copied());
+                c.free.entry(b.size).or_default().push(b.ptr);
+                c.cached_bytes += b.size;
+            }
+            !done
+        });
+    }
+
     fn alloc(&self, drv: &Driver, bytes: usize) -> Result<CuPtr, E> {
         let size = bucket(bytes);
         let mut c = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        self.reap(drv, &mut c, false);
         if let Some(p) = c.free.get_mut(&size).and_then(|v| v.pop()) {
             c.cached_bytes -= size;
             return Ok(p);
@@ -485,6 +569,7 @@ impl Dev {
         let mut r = unsafe { (drv.mem_alloc)(&mut p, size) };
         let mut got = size;
         if r == CUDA_ERROR_OUT_OF_MEMORY {
+            self.reap(drv, &mut c, true);
             self.flush(drv, &mut c);
             r = unsafe { (drv.mem_alloc)(&mut p, size) };
             if r == CUDA_ERROR_OUT_OF_MEMORY && bytes.div_ceil(256) * 256 < size {
@@ -497,12 +582,39 @@ impl Dev {
         Ok(p)
     }
 
-    fn release(&self, ptr: CuPtr) {
+    /// Returns a block to the allocator. If explicit streams exist, the block is held back until all work
+    /// enqueued before this call, on the default stream and on every live explicit stream, has completed
+    /// (the contract's rule for `free`); otherwise it is reusable at once, as stream order makes that safe.
+    fn release(&self, drv: &Driver, ptr: CuPtr) {
+        let live: Vec<usize> = self.streams.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let mut c = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(&size) = c.sizes.get(&ptr) {
-            c.free.entry(size).or_default().push(ptr);
-            c.cached_bytes += size;
+        let Some(&size) = c.sizes.get(&ptr) else { return };
+        if !live.is_empty() {
+            let mut events = Vec::with_capacity(live.len() + 1);
+            let mut ok = true;
+            for s in std::iter::once(0usize).chain(live) {
+                let spare = self.spare_events.lock().unwrap_or_else(|p| p.into_inner()).pop();
+                let mut ev = spare.map_or(std::ptr::null_mut(), |e| e as Handle);
+                if ev.is_null() && unsafe { (drv.event_create)(&mut ev, CU_EVENT_DISABLE_TIMING) } != 0 {
+                    ok = false;
+                    break;
+                }
+                events.push(ev as usize);
+                if unsafe { (drv.event_record)(ev, s as Handle) } != 0 {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                self.pending.lock().unwrap_or_else(|p| p.into_inner()).push(Pending { ptr, size, events });
+                return;
+            }
+            // Could not track it: fall back to waiting for everything, which is always safe.
+            unsafe { (drv.ctx_synchronize)() };
+            self.spare_events.lock().unwrap_or_else(|p| p.into_inner()).extend(events);
         }
+        c.free.entry(size).or_default().push(ptr);
+        c.cached_bytes += size;
     }
 }
 
@@ -559,8 +671,8 @@ unsafe extern "C" fn free(device: u32, ptr: *mut c_void) {
         if ptr.is_null() {
             return Ok(());
         }
-        let (_, dev) = enter(device)?;
-        dev.release(ptr as usize as CuPtr);
+        let (drv, dev) = enter(device)?;
+        dev.release(drv, ptr as usize as CuPtr);
         Ok(())
     });
 }
@@ -753,7 +865,7 @@ impl Driver {
                 1,
                 1,
                 0,
-                std::ptr::null_mut(),
+                cur_stream(),
                 params.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
@@ -824,6 +936,7 @@ fn gemm(drv: &Driver, dev: &Dev, g: Gemm) -> Result<(), E> {
         let r = {
             let hd = h.0.lock().unwrap_or_else(|p| p.into_inner());
             unsafe {
+                (bl.set_stream)(*hd as Handle, cur_stream());
                 (bl.sgemm)(
                     *hd as Handle,
                     op_b,
@@ -900,7 +1013,7 @@ fn gemm(drv: &Driver, dev: &Dev, g: Gemm) -> Result<(), E> {
                 16,
                 1,
                 0,
-                std::ptr::null_mut(),
+                cur_stream(),
                 params.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
@@ -909,7 +1022,7 @@ fn gemm(drv: &Driver, dev: &Dev, g: Gemm) -> Result<(), E> {
     })();
     // Stream ordering makes it safe to recycle the scratch right away.
     for t in scratch {
-        dev.release(t);
+        dev.release(drv, t);
     }
     res
 }
@@ -933,6 +1046,7 @@ fn gemm_half(drv: &Driver, dev: &Dev, g: Gemm, dtype: u32) -> Result<(), E> {
     let r = {
         let hd = h.0.lock().unwrap_or_else(|p| p.into_inner());
         unsafe {
+            (bl.set_stream)(*hd as Handle, cur_stream());
             (bl.gemm_ex)(
                 *hd as Handle,
                 op_b,
@@ -1046,7 +1160,7 @@ fn run_staged(
     })();
     // Stream ordering makes it safe to recycle the scratch right away.
     for t in scratch {
-        dev.release(t);
+        dev.release(drv, t);
     }
     res
 }
@@ -1397,7 +1511,7 @@ fn run(
             })();
             // Stream ordering makes it safe to recycle the scratch immediately.
             if let Some(s) = scratch {
-                dev.release(s);
+                dev.release(drv, s);
             }
             res
         }
@@ -1467,6 +1581,187 @@ unsafe extern "C" fn execute(
     })
 }
 
+// ---- streams, events, pinned memory (docs/plugin-abi.md section 5.1) ---------------------------
+
+unsafe extern "C" fn stream_create(device: u32, out: *mut u64) -> Status {
+    wrap(|| {
+        let (drv, dev) = enter(device)?;
+        let mut s: Handle = std::ptr::null_mut();
+        drv.check(
+            unsafe { (drv.stream_create)(&mut s, CU_STREAM_NON_BLOCKING) },
+            "cuStreamCreate",
+        )?;
+        dev.streams.lock().unwrap_or_else(|p| p.into_inner()).push(s as usize);
+        unsafe { *out = s as usize as u64 };
+        Ok(())
+    })
+}
+
+/// Waits for the stream's work first: blocks freed while it was alive were only protected by events on
+/// live streams, so a destroyed stream must not still be writing to memory that has been recycled.
+unsafe extern "C" fn stream_destroy(device: u32, stream: u64) {
+    let _ = wrap(|| {
+        let (drv, dev) = enter(device)?;
+        let s = stream as usize as Handle;
+        drv.check(unsafe { (drv.stream_synchronize)(s) }, "cuStreamSynchronize")?;
+        dev.streams.lock().unwrap_or_else(|p| p.into_inner()).retain(|&x| x != stream as usize);
+        drv.check(unsafe { (drv.stream_destroy)(s) }, "cuStreamDestroy")
+    });
+}
+
+unsafe extern "C" fn event_create(device: u32, out: *mut u64) -> Status {
+    wrap(|| {
+        let (drv, _) = enter(device)?;
+        let mut e: Handle = std::ptr::null_mut();
+        drv.check(unsafe { (drv.event_create)(&mut e, CU_EVENT_DISABLE_TIMING) }, "cuEventCreate")?;
+        unsafe { *out = e as usize as u64 };
+        Ok(())
+    })
+}
+
+unsafe extern "C" fn event_destroy(device: u32, event: u64) {
+    let _ = wrap(|| {
+        let (drv, _) = enter(device)?;
+        drv.check(unsafe { (drv.event_destroy)(event as usize as Handle) }, "cuEventDestroy")
+    });
+}
+
+unsafe extern "C" fn event_record(device: u32, event: u64, stream: u64) -> Status {
+    wrap(|| {
+        let (drv, _) = enter(device)?;
+        drv.check(
+            unsafe { (drv.event_record)(event as usize as Handle, stream as usize as Handle) },
+            "cuEventRecord",
+        )
+    })
+}
+
+unsafe extern "C" fn stream_wait(device: u32, stream: u64, event: u64) -> Status {
+    wrap(|| {
+        let (drv, _) = enter(device)?;
+        drv.check(
+            unsafe { (drv.stream_wait_event)(stream as usize as Handle, event as usize as Handle, 0) },
+            "cuStreamWaitEvent",
+        )
+    })
+}
+
+unsafe extern "C" fn event_sync(device: u32, event: u64) -> Status {
+    wrap(|| {
+        let (drv, _) = enter(device)?;
+        drv.check(unsafe { (drv.event_synchronize)(event as usize as Handle) }, "cuEventSynchronize")
+    })
+}
+
+unsafe extern "C" fn event_query(device: u32, event: u64) -> i32 {
+    let mut out = -1;
+    let _ = wrap(|| {
+        let (drv, _) = enter(device)?;
+        let r = unsafe { (drv.event_query)(event as usize as Handle) };
+        if r == 0 {
+            out = 1;
+            Ok(())
+        } else if r == CUDA_ERROR_NOT_READY {
+            out = 0;
+            Ok(())
+        } else {
+            drv.check(r, "cuEventQuery")
+        }
+    });
+    out
+}
+
+unsafe extern "C" fn execute_on(
+    device: u32,
+    stream: u64,
+    op_code: u32,
+    attrs: *const OpAttrs,
+    inputs: *const TensorDesc,
+    n_inputs: u32,
+    outputs: *const TensorDesc,
+    n_outputs: u32,
+) -> Status {
+    CUR_STREAM.with(|c| c.set(stream as usize));
+    let r = unsafe { execute(device, op_code, attrs, inputs, n_inputs, outputs, n_outputs) };
+    CUR_STREAM.with(|c| c.set(0));
+    r
+}
+
+unsafe extern "C" fn copy_from_host_async(
+    device: u32,
+    stream: u64,
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+) -> Status {
+    wrap(|| {
+        let (drv, _) = enter(device)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        drv.check(
+            unsafe { (drv.htod_async)(dst as usize as CuPtr, src, bytes, stream as usize as Handle) },
+            "cuMemcpyHtoDAsync",
+        )
+    })
+}
+
+unsafe extern "C" fn copy_to_host_async(
+    device: u32,
+    stream: u64,
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+) -> Status {
+    wrap(|| {
+        let (drv, _) = enter(device)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        drv.check(
+            unsafe { (drv.dtoh_async)(dst, src as usize as CuPtr, bytes, stream as usize as Handle) },
+            "cuMemcpyDtoHAsync",
+        )
+    })
+}
+
+/// Page-locked, portable host memory. The entry point has no device argument, so it uses device 0's
+/// context; `CU_MEMHOSTALLOC_PORTABLE` makes the memory pinned for every device's context.
+unsafe extern "C" fn alloc_host(bytes: usize, out: *mut *mut c_void) -> Status {
+    wrap(|| {
+        let (drv, _) = enter(0)?;
+        drv.check(
+            unsafe { (drv.host_alloc)(out, bytes, CU_MEMHOSTALLOC_PORTABLE) },
+            &format!("cuMemHostAlloc of {bytes} bytes"),
+        )
+    })
+}
+
+unsafe extern "C" fn free_host(ptr: *mut c_void) {
+    let _ = wrap(|| {
+        let (drv, _) = enter(0)?;
+        drv.check(unsafe { (drv.host_free)(ptr) }, "cuMemFreeHost")
+    });
+}
+
+static STREAMS: StreamVTable = StreamVTable {
+    struct_size: size_of::<StreamVTable>() as u32,
+    reserved: 0,
+    stream_create,
+    stream_destroy,
+    event_create,
+    event_destroy,
+    event_record,
+    stream_wait,
+    event_sync,
+    event_query,
+    execute_on,
+    copy_from_host_async,
+    copy_to_host_async,
+    alloc_host: Some(alloc_host),
+    free_host: Some(free_host),
+};
+
 static VTABLE: PluginVTable = PluginVTable {
     abi_version: ABI_VERSION,
     struct_size: VTABLE_SIZE,
@@ -1484,6 +1779,7 @@ static VTABLE: PluginVTable = PluginVTable {
     synchronize,
     last_error,
     supports_op_dtype: Some(supports_op_dtype),
+    streams: &STREAMS,
 };
 
 #[unsafe(no_mangle)]
